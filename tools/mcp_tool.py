@@ -4961,7 +4961,23 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                     _server_connect_errors.pop(name, None)
 
     # Per-server timeouts are handled inside _discover_and_register_server.
-    # The outer timeout is generous: 120s total for parallel discovery.
+    # The outer timeout is generous: 120s total for parallel discovery by
+    # default. On timeout, _run_on_mcp_loop cancels the in-flight gather —
+    # including any still-connecting server — so a slow OAuth cold-connect
+    # (pipedrive/fyxer routinely need OAuth refresh + DCR re-registration)
+    # can get killed here even though its own `connect_timeout` budget
+    # hasn't run out yet, causing the boot-time pre-warm call to finish
+    # without it (tools land later via the between-turns refresh instead,
+    # invalidating the prompt-cache prefix on the first turn that needs
+    # them). Deployments that need the full pre-warm to actually cover a
+    # slow server raise `mcp_discovery_timeout` in config; honor that here
+    # as a floor so the outer bound is never shorter than what the operator
+    # configured, while leaving the 120s default unchanged everywhere else.
+    try:
+        from hermes_cli.mcp_startup import _resolve_discovery_timeout
+        _outer_timeout = max(120, _resolve_discovery_timeout(None))
+    except Exception:
+        _outer_timeout = 120
     #
     # Temporarily clear the interrupt flag on the current thread so that MCP
     # discovery is never cancelled by a stale interrupt from a prior agent
@@ -4971,7 +4987,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     if _was_interrupted:
         _set_interrupt(False)
     try:
-        _run_on_mcp_loop(_discover_all, timeout=120)
+        _run_on_mcp_loop(_discover_all, timeout=_outer_timeout)
     finally:
         if _was_interrupted:
             _set_interrupt(True)
