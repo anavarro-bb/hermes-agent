@@ -1661,6 +1661,66 @@ class APIServerAdapter(BasePlatformAdapter):
             "data": data,
         })
 
+    async def _handle_mcp_status(self, request: "web.Request") -> "web.Response":
+        """GET /v1/mcp/status — live connection state of configured MCP servers.
+
+        Serves the in-process registry truth (``tools.mcp_tool._servers``), not
+        a fresh probe: a server whose task exists but has no live session is
+        parked or mid-reconnect, which is exactly the state external watchers
+        (WhatsApp connector health banner, token guardian cron) need to see.
+        States: ``connected`` | ``connecting`` | ``disconnected`` | ``disabled``.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from tools import mcp_tool
+            from hermes_cli.config import load_config
+
+            config = load_config()
+            configured = config.get("mcp_servers") or {}
+            data: List[Dict[str, Any]] = []
+            for name, cfg in configured.items():
+                if not isinstance(cfg, dict):
+                    continue
+                enabled = bool(cfg.get("enabled", True))
+                task = mcp_tool._servers.get(name)
+                connected = bool(task and task.session)
+                if not enabled:
+                    state = "disabled"
+                elif connected:
+                    state = "connected"
+                elif name in mcp_tool._server_connecting:
+                    state = "connecting"
+                else:
+                    state = "disconnected"
+                last_error = mcp_tool._server_connect_errors.get(name)
+                if not last_error and task is not None and task._error is not None:
+                    last_error = str(task._error)
+                data.append({
+                    "name": name,
+                    "enabled": enabled,
+                    "state": state,
+                    "connected": connected,
+                    "auth": str(cfg.get("auth") or ""),
+                    "transport": "http" if cfg.get("url") else "stdio",
+                    "tools": len(task._registered_tool_names) if task else 0,
+                    "last_error": (str(last_error)[:500] if last_error else None),
+                })
+        except Exception:
+            logger.exception("GET /v1/mcp/status failed")
+            return web.json_response(
+                _openai_error("Failed to read MCP status", err_type="server_error"),
+                status=500,
+            )
+
+        return web.json_response({
+            "object": "list",
+            "platform": "api_server",
+            "data": data,
+        })
+
     # ------------------------------------------------------------------
     # /api/sessions — thin client/session resource API
     # ------------------------------------------------------------------
@@ -4847,6 +4907,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
+            self._app.router.add_get("/v1/mcp/status", self._handle_mcp_status)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)
