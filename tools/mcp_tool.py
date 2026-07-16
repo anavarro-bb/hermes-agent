@@ -1517,7 +1517,7 @@ class MCPServerTask:
 
     __slots__ = (
         "name", "session", "tool_timeout",
-        "_task", "_ready", "_shutdown_event", "_reconnect_event",
+        "_task", "_park_on_cancel", "_ready", "_shutdown_event", "_reconnect_event",
         "_tools", "_error", "_config",
         "_sampling", "_elicitation",
         "_registered_tool_names", "_auth_type", "_refresh_lock",
@@ -1534,6 +1534,10 @@ class MCPServerTask:
         self.session: Optional[Any] = None
         self.tool_timeout: float = _DEFAULT_TOOL_TIMEOUT
         self._task: Optional[asyncio.Task] = None
+        # start() sets this before cancelling run() on connect-timeout so
+        # the task parks (timed self-probe) instead of dying (#59349 vs
+        # boot resilience). Bare cancels leave it False and still kill.
+        self._park_on_cancel = False
         self._ready = asyncio.Event()
         self._shutdown_event = asyncio.Event()
         # Set by tool handlers on auth failure after manager.handle_401()
@@ -2733,17 +2737,66 @@ class MCPServerTask:
                 self.session = None
                 continue
             except asyncio.CancelledError:
-                # Task was cancelled (shutdown, gateway restart, explicit
-                # task.cancel()). Don't treat this as a connection failure —
                 # CancelledError inherits from BaseException (not Exception)
                 # in Python 3.11+, so the broad ``except Exception`` below
-                # would NOT catch it; we'd silently exit the reconnect loop
-                # and the MCP server would stay dead until Hermes is fully
-                # restarted. Re-raise so the task's cancellation propagates
-                # correctly to asyncio's task machinery and ``shutdown()``'s
-                # ``await self._task`` completes. See #9930.
+                # would NOT catch it; without this handler we'd silently
+                # exit the reconnect loop (#9930).
+                #
+                # Two distinct cancellation sources reach this task:
+                #   1. Real teardown — shutdown() timed out awaiting us, or
+                #      the process is exiting. Re-raise so cancellation
+                #      propagates and ``await self._task`` completes.
+                #   2. start()'s connect-timeout cancel (#59349): the outer
+                #      discovery wait_for expired on a slow cold-connect
+                #      (OAuth refresh + DCR can exceed it) and start()
+                #      cancelled us so hung transports unwind. The transport
+                #      context managers HAVE unwound by the time we're here;
+                #      dying now would leave the server dead until the next
+                #      full restart. Uncancel and park with the timed
+                #      self-probe instead — the parked task is shutdown-aware
+                #      and owns its own lifecycle.
+                # Only start()'s connect-timeout cancel opts in via
+                # _park_on_cancel; bare cancels (loop teardown, #9930's
+                # explicit task.cancel()) must still propagate, or
+                # asyncio.run()'s cancel-all-tasks shutdown would hang on
+                # a task that refuses to die.
                 self.session = None
-                raise
+                current = asyncio.current_task()
+                if (
+                    self._shutdown_event.is_set()
+                    or current is None
+                    or not self._park_on_cancel
+                ):
+                    raise
+                self._park_on_cancel = False
+                while current.cancelling():
+                    current.uncancel()
+                logger.warning(
+                    "MCP server '%s': connect cancelled without shutdown "
+                    "(discovery timeout or caller abort); parking with "
+                    "self-probe every %ds instead of dying.",
+                    self.name, _PARKED_RETRY_INTERVAL,
+                )
+                self._ready.set()
+                self._deregister_tools()
+                self._reconnect_event.clear()
+                parked = await self._wait_for_reconnect_or_shutdown(
+                    timeout=_PARKED_RETRY_INTERVAL
+                )
+                if parked == "shutdown":
+                    return
+                logger.info(
+                    "MCP server '%s': attempting revival after cancelled "
+                    "connect (self-probe or explicit reconnect request); "
+                    "rebuilding transport.",
+                    self.name,
+                )
+                initial_retries = 0
+                self._reconnect_retries = 0
+                backoff = 1.0
+                self._error = None
+                self._ready.clear()
+                continue
             except Exception as exc:
                 self.session = None
                 if self._is_recycled_stdio():
@@ -2907,8 +2960,13 @@ class MCPServerTask:
             # keep running detached — parked on a hung transport with no
             # owner to reap it (#59349). Propagate the cancellation so the
             # transport context managers unwind and their finally blocks
-            # release the child process / FDs.
+            # release the child process / FDs. The task parks with a timed
+            # self-probe instead of dying (_park_on_cancel), so a slow
+            # cold-connect (OAuth refresh + DCR) that outlives the caller's
+            # budget still recovers on its own instead of staying dead
+            # until the next full restart.
             if self._task and not self._task.done():
+                self._park_on_cancel = True
                 self._task.cancel()
             raise
         if self._error:
