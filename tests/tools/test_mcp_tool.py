@@ -2031,8 +2031,10 @@ class TestReconnection:
 
         asyncio.run(_test())
 
-    def test_initial_oauth_failure_does_not_retry(self):
-        """Initial OAuth failures stop immediately to avoid repeated browser prompts."""
+    def test_initial_oauth_failure_parks_without_hot_retry(self):
+        """Initial OAuth failures park with a timed self-probe: no immediate
+        retry burst (that would spam browser prompts), but the task must stay
+        alive so refreshed credentials are picked up without a restart."""
         from tools.mcp_tool import MCPServerTask
 
         run_count = 0
@@ -2048,6 +2050,8 @@ class TestReconnection:
                 return await original_run_stdio(self_srv, config)
             raise oauth_error
 
+        real_sleep = asyncio.sleep
+
         async def _test():
             nonlocal target_server
             server = MCPServerTask("oauth_srv")
@@ -2056,12 +2060,22 @@ class TestReconnection:
             with patch.object(MCPServerTask, "_run_stdio", patched_run_stdio), \
                  patch("tools.mcp_tool._is_auth_error", return_value=True), \
                  patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-                await server.run({"command": "test"})
+                run_task = asyncio.ensure_future(server.run({"command": "test"}))
+                # Yield until the failure is processed and the task parks.
+                for _ in range(2000):
+                    await real_sleep(0)
+                    if server._ready.is_set():
+                        break
 
-            assert run_count == 1
-            assert server._error is oauth_error
-            assert server._ready.is_set()
-            assert mock_sleep.await_count == 0
+                assert server._ready.is_set()
+                assert server._error is oauth_error
+                assert run_count == 1  # no hot retry loop
+                assert not run_task.done(), "task died instead of parking"
+                assert mock_sleep.await_count == 0  # parked wait, not sleep-backoff
+
+                server._shutdown_event.set()
+                server._reconnect_event.set()
+                await asyncio.wait_for(run_task, timeout=2)
 
         asyncio.run(_test())
 

@@ -2762,12 +2762,31 @@ class MCPServerTask:
                     if _is_auth_error(exc):
                         logger.warning(
                             "MCP server '%s' failed initial OAuth authentication, "
-                            "not retrying automatically: %s",
-                            self.name, exc,
+                            "parking until credentials are refreshed or a "
+                            "reconnect is requested; self-probing every %ds: %s",
+                            self.name, _PARKED_RETRY_INTERVAL, exc,
                         )
                         self._error = exc
                         self._ready.set()
-                        return
+                        self._deregister_tools()
+                        self._reconnect_event.clear()
+                        parked = await self._wait_for_reconnect_or_shutdown(
+                            timeout=_PARKED_RETRY_INTERVAL
+                        )
+                        if parked == "shutdown":
+                            return
+                        logger.info(
+                            "MCP server '%s': attempting revival after boot-time "
+                            "OAuth failure (self-probe or explicit reconnect "
+                            "request); rebuilding transport.",
+                            self.name,
+                        )
+                        initial_retries = 0
+                        self._reconnect_retries = 0
+                        backoff = 1.0
+                        self._error = None
+                        self._ready.clear()
+                        continue
 
                     initial_retries += 1
                     if initial_retries > _MAX_INITIAL_CONNECT_RETRIES:
@@ -3179,7 +3198,13 @@ def _is_auth_error(exc: BaseException) -> bool:
     ``httpx.HTTPStatusError`` is only treated as auth-related when the
     response status code is 401. Other HTTP errors fall through to the
     generic error path in the tool handlers.
+
+    Errors raised inside the MCP SDK's anyio task group arrive wrapped in
+    an ``ExceptionGroup`` (see _preflight note above), so groups are
+    unwrapped recursively before classification.
     """
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_is_auth_error(sub) for sub in exc.exceptions)
     types = _get_auth_error_types()
     if not types or not isinstance(exc, types):
         return False
